@@ -1,0 +1,50 @@
+#!/bin/bash
+
+CSV="/****/****.csv"
+IFS=','
+
+tail -n +2 "$CSV" | while read -r SamAccountName GivenName Surname Mail Department Folder MemberOf
+do
+    SamAccountName=$(echo "$SamAccountName" | tr -d '"')
+    GivenName=$(echo "$GivenName" | tr -d '"')
+    Surname=$(echo "$Surname" | tr -d '"')
+    Mail=$(echo "$Mail" | tr -d '"')
+    Department=$(echo "$Department" | tr -d '"')
+    Folder=$(echo "$Folder" | tr -d '"')
+    MemberOf=$(echo "$MemberOf" | tr -d '"' | tr ';' ',')
+
+    # Build DN path
+    OU="OU=${Folder},OU=*** USERS,OU=****,DC=****,DC=****"
+
+    # Check for admin users
+    if [[ "$MemberOf" == *"Domain Admins"* ]] || [[ "$MemberOf" == *"Admins"* ]]; then
+        PASSWORD='****'
+    else
+        PASSWORD='***'
+    fi
+
+    echo "Creating user: $SamAccountName (Folder: $Folder)"
+
+    # Create the user
+    samba-tool user create "$SamAccountName" "$PASSWORD" \
+        --given-name="$GivenName" \
+        --surname="$Surname" \
+        --mail-address="$Mail" \
+        --department="$Department" \
+        --userou="$OU" \
+        --home-directory="/home/$SamAccountName"
+
+    # Force password change at next login
+    samba-tool user setexpiry "$SamAccountName" --days=0
+
+    # Add user to groups
+    IFS=',' read -ra GROUPS <<< "$MemberOf"
+    for group in "${GROUPS[@]}"; do
+        group=$(echo "$group" | xargs)
+        if [ -n "$group" ]; then
+            echo "  Adding $SamAccountName to group: $group"
+            samba-tool group addmembers "$group" "$SamAccountName"
+        fi
+    done
+
+done
