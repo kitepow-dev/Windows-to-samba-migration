@@ -1,0 +1,28 @@
+# Define the base OU
+$ou = "OU=*** USERS,OU=****,DC=***, DC=***"
+
+# Get all users recursively
+$users = Get-ADUser -SearchBase $ou -SearchScope Subtree -Filter * -Properties SamAccountName, GivenName, Surname, Mail, Department
+
+# Create array to hold export
+$export = @()
+
+foreach ($user in $users) {
+    # Get group memberships for each user
+    $groups = Get-ADUser $user.SamAccountName -Properties MemberOf | Select-Object -ExpandProperty MemberOf
+
+    # Extract clean group names (e.g., CN=GroupName,... → GroupName)
+    $groupNames = ($groups | ForEach-Object { ($_ -split ',')[0] -replace '^CN=' }) -join '; '
+
+    $export += [PSCustomObject]@{
+        SamAccountName = $user.SamAccountName
+        GivenName      = $user.GivenName
+        Surname        = $user.Surname
+        Mail           = $user.Mail
+        Department     = $user.Department
+        MemberOf       = $groupNames
+    }
+}
+
+# Export to CSV
+$export | Export-Csv -Path "C:\Temp\lab_users_export.csv" -NoTypeInformation -Encoding UTF8
