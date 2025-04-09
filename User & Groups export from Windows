@@ -1,28 +1,158 @@
-# Define the base OU
-$ou = "OU=*** USERS,OU=****,DC=***, DC=***"
+<#
+.SYNOPSIS
+Exports user information, including group memberships, from a specified Active Directory OU to a CSV file.
 
-# Get all users recursively
-$users = Get-ADUser -SearchBase $ou -SearchScope Subtree -Filter * -Properties SamAccountName, GivenName, Surname, Mail, Department
+.DESCRIPTION
+This script retrieves users from a defined Organizational Unit (OU) and its sub-OUs within Active Directory.
+For each user, it gathers standard properties (SamAccountName, GivenName, Surname, Mail, Department)
+and processes their group memberships into a semicolon-separated list of group names.
+The collected data is then exported to a CSV file.
 
-# Create array to hold export
+.AUTHOR
+[Kitepow-Dev] 
+
+.VERSION
+1.0.0 (2025-04-09)
+
+.PREREQUISITES
+- Windows PowerShell (typically version 3.0 or higher for Get-ADUser).
+- Active Directory PowerShell Module installed (usually part of Remote Server Administration Tools - RSAT).
+- Sufficient permissions for the executing user to read user properties and group memberships from the target OU in Active Directory.
+
+.OUTPUTS
+A CSV file containing user data with the following columns:
+- SamAccountName
+- GivenName
+- Surname
+- Mail
+- Department
+- MemberOf (Semicolon-separated list of group names)
+
+.PARAMETER OU
+The Distinguished Name (DN) of the base Organizational Unit to search within. Users in this OU and any sub-OUs will be included.
+
+.PARAMETER ExportPath
+The full path, including filename, where the CSV report will be saved.
+
+.EXAMPLE
+.\Export-ADUsersToCsv.ps1 -OU "OU=Managed Users,OU=Company,DC=mycorp,DC=local" -ExportPath "C:\Temp\ADUserExport.csv"
+# This command exports users from the specified OU to the designated CSV file.
+
+.NOTES
+- Ensure the OU path ($ou variable or parameter) and export path ($exportPath variable or parameter) are correctly configured for your environment.
+- The script extracts only the Common Name (CN) part of the group names from the full group DN.
+- The CSV file is exported using UTF8 encoding without type information.
+- Consider running this script on a domain-joined machine or a machine with RSAT installed and configured.
+#>
+
+# --- Configuration ---
+# ---vvv--- MODIFY THESE VALUES FOR YOUR ENVIRONMENT ---vvv---
+
+# Define the base OU (Distinguished Name) to search for users within.
+# Replace the asterisks with your actual OU and Domain Component paths.
+$ou = "OU=*** USERS,OU=****,DC=***,DC=***"
+# Example: $ou = "OU=LAB USERS,OU=LABOR,DC=labor,DC=lan"
+
+# Define the full path where the output CSV file will be saved.
+# Ensure the directory (e.g., C:\Temp) exists or adjust the path.
+$exportPath = "C:\Temp\lab_users_export.csv"
+
+# ---vvv--- END OF CONFIGURATION ---vvv---
+
+# --- Script Execution ---
+
+# Display starting information
+Write-Host "🚀 Starting Active Directory User Export..."
+Write-Host "ℹ️ Searching for users in OU: $ou"
+Write-Host "ℹ️ Exporting results to: $exportPath"
+Write-Host "--------------------------------------------------"
+
+# Check if the Active Directory module is available
+if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+    Write-Error "❌ FATAL ERROR: Active Directory PowerShell module is not available. Please install RSAT or run this on a machine with the module."
+    exit 1
+}
+
+# Get all user objects recursively from the specified base OU.
+# -SearchBase specifies the starting point of the search.
+# -SearchScope Subtree includes the base OU and all OUs underneath it.
+# -Filter * retrieves all objects matching the default type (users).
+# -Properties specifies which attributes to retrieve for each user object.
+#   Requesting 'MemberOf' here isn't strictly necessary as we retrieve it again later,
+#   but including common properties improves efficiency if needed elsewhere.
+Write-Host "⏳ Retrieving user list from Active Directory..."
+try {
+    $users = Get-ADUser -SearchBase $ou -SearchScope Subtree -Filter * -Properties SamAccountName, GivenName, Surname, Mail, Department -ErrorAction Stop
+    Write-Host "✅ Found $($users.Count) user accounts."
+} catch {
+    Write-Error "❌ ERROR: Failed to retrieve users from OU '$ou'. Check the OU path and permissions."
+    Write-Error "Underlying error: $($_.Exception.Message)"
+    exit 1
+}
+
+
+# Create an empty array to hold the custom objects for export.
 $export = @()
 
+Write-Host "⏳ Processing user details and group memberships..."
+# Loop through each user found in the previous step.
+$userCounter = 0
 foreach ($user in $users) {
-    # Get group memberships for each user
-    $groups = Get-ADUser $user.SamAccountName -Properties MemberOf | Select-Object -ExpandProperty MemberOf
+    $userCounter++
+    Write-Progress -Activity "Processing Users" -Status "Processing user $userCounter of $($users.Count): $($user.SamAccountName)" -PercentComplete (($userCounter / $users.Count) * 100)
 
-    # Extract clean group names (e.g., CN=GroupName,... → GroupName)
-    $groupNames = ($groups | ForEach-Object { ($_ -split ',')[0] -replace '^CN=' }) -join '; '
+    # For each user, specifically get their 'MemberOf' property which contains the list of group Distinguished Names (DNs).
+    # Using try/catch block for robustness in case a specific user query fails.
+    try {
+        $groups = Get-ADUser $user.SamAccountName -Properties MemberOf -ErrorAction Stop | Select-Object -ExpandProperty MemberOf
+    } catch {
+        Write-Warning "⚠️ Warning: Failed to retrieve group membership for user '$($user.SamAccountName)'. Error: $($_.Exception.Message)"
+        $groups = @() # Assign empty array if retrieval fails
+    }
 
+
+    # Process the list of group DNs to extract just the group names.
+    # The 'MemberOf' property contains strings like: "CN=GroupName,OU=Groups,DC=domain,DC=com"
+    $groupNames = ($groups | ForEach-Object {
+        # For each group DN string:
+        # 1. Split the string by the comma character (',').
+        # 2. Take the first element ([0]), which should be "CN=GroupName".
+        # 3. Remove the leading "CN=" using -replace.
+        ($_ -split ',')[0] -replace '^CN='
+    }) -join '; ' # Join the extracted group names into a single string, separated by semicolon and space.
+
+    # Create a custom PowerShell object ([PSCustomObject]) with the desired properties for this user.
+    # This structure maps directly to the columns in the final CSV.
     $export += [PSCustomObject]@{
         SamAccountName = $user.SamAccountName
         GivenName      = $user.GivenName
         Surname        = $user.Surname
         Mail           = $user.Mail
         Department     = $user.Department
-        MemberOf       = $groupNames
+        MemberOf       = $groupNames # The processed, semicolon-separated list of group names
     }
 }
 
-# Export to CSV
-$export | Export-Csv -Path "C:\Temp\lab_users_export.csv" -NoTypeInformation -Encoding UTF8
+# Check if any users were processed
+if ($export.Count -eq 0) {
+    Write-Warning "⚠️ No user data was processed or collected. The export file will be empty or not created."
+    # Depending on requirements, you might exit here or allow an empty file export.
+}
+
+# Export the array of custom objects to a CSV file.
+# -Path specifies the output file location (from config).
+# -NoTypeInformation prevents PowerShell from adding "#TYPE PSCustomObject" as the first line.
+# -Encoding UTF8 ensures compatibility with various systems and special characters.
+# -Force overwrites the file if it already exists. Add -Append to add to an existing file instead.
+Write-Host "⏳ Exporting data to CSV file: $exportPath"
+try {
+    $export | Export-Csv -Path $exportPath -NoTypeInformation -Encoding UTF8 -Force -ErrorAction Stop
+    Write-Host "✅ Successfully exported $($export.Count) user records to $exportPath"
+} catch {
+    Write-Error "❌ ERROR: Failed to export data to CSV file '$exportPath'. Check permissions and path validity."
+    Write-Error "Underlying error: $($_.Exception.Message)"
+    exit 1
+}
+
+Write-Host "=================================================="
+Write-Host "✅ Script finished."
