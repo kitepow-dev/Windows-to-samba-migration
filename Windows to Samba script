@@ -1,50 +1,331 @@
 #!/bin/bash
+#
+# ==============================================================================
+# Samba User Creation Script Template
+# ==============================================================================
+#
+# Purpose:
+#   Bulk creates or updates user accounts in a Samba Active Directory
+#   domain based on input from a CSV file. Creates necessary Organizational
+#   Units (OUs) if they don't exist.
+#
+# Author:
+#   [Kitepow-Dev]
+#
+# Version:
+#   1.0.0 (2025-04-09)
+#
+# Prerequisites:
+#   - Bash shell
+#   - `samba-tool` command available and configured for the target domain.
+#   - A CSV file with user data (format defined below).
+#   - Sufficient permissions for the executing user to:
+#     - Create OUs within the specified BASE_OU path.
+#     - Create/Delete/Modify users within those OUs.
+#     - Add users to groups.
+#
+# CSV File Format:
+#   - Comma-separated values.
+#   - Header row is expected and skipped.
+#   - Columns (order matters):
+#     1. SamAccountName (Username)
+#     2. GivenName (First Name - can include middle initial/dot)
+#     3. Surname (Last Name - if empty, script attempts extraction from GivenName)
+#     4. Mail (Email address - uses default if empty)
+#     5. Department (Optional department name)
+#     6. Folder (The name of the specific OU under BASE_OU, e.g., "Group2025", "Sales")
+#     7. MemberOf (Semicolon-separated list of groups, e.g., "Domain Users;Remote Desktop Users")
+#
+# Usage:
+#   1. Configure the variables in the '--- Configuration ---' section below.
+#   2. Place your CSV file at the location specified by CSV_FILE.
+#   3. Make the script executable: chmod +x ./create_samba_users.sh
+#   4. Run the script (likely requires sudo/root): sudo bash ./create_samba_users.sh
+#
+# Important Notes:
+#   - **BACKUP YOUR SAMBA DATA** before running this script.
+#   - **TEST THOROUGHLY** with a small sample CSV file first.
+#   - The user deletion feature is enabled by default. Comment out the
+#     deletion block if you only want to create new users or update existing ones
+#     (though this script primarily replaces existing users).
+#   - Ensure home directory paths (`--home-directory`) are valid for your setup.
+#
+# ==============================================================================
 
-CSV="/****/****.csv"
+# --- Configuration ---
+# ---vvv--- MODIFY THESE VALUES FOR YOUR ENVIRONMENT ---vvv---
+
+# Path to the input CSV file containing user data.
+CSV_FILE="/path/to/your/file"
+
+# The base OU path under which specific 'Folder' OUs from the CSV will be created.
+# Example: If BASE_OU="OU=Users,OU=Company" and Folder="Sales", the target OU will be OU=Sales,OU=Users,OU=Company,...
+BASE_OU="OU=LAB USERS,OU=LABOR"
+
+# The Distinguished Name (DN) of your Samba domain.
+# Verify this using `samba-tool domain info`.
+DOMAIN_DN="DC=labor,DC=lan"
+
+# Default email address to use if the Mail field in the CSV is empty.
+DEFAULT_MAIL="first.lastname@example.com"
+
+# Default password for newly created regular users.
+# IMPORTANT: Ensure this meets your domain's password policy.
+DEFAULT_PASSWORD='SuperStrongPassword123'
+
+# Password for users identified as administrators (by Folder or Group membership).
+# IMPORTANT: Ensure this meets your domain's password policy.
+ADMIN_PASSWORD='$SupeRsTrongPa$$w@rd56!'
+
+# Home directory base path. %USERNAME% will be replaced by the SamAccountName.
+# Ensure this path exists and appropriate permissions/shares are set up.
+# Example: "/srv/samba/homes/%USERNAME%" or "\\server\homes\%USERNAME%"
+# Using /home/ is typical for Linux environments integrated with Samba.
+HOME_DIRECTORY_TEMPLATE="/home/%USERNAME%"
+
+# Set to "true" to enable deleting existing users before creation, "false" to skip deletion.
+# If false, user creation will fail if the user already exists.
+ENABLE_USER_DELETION="true"
+
+# ---^^^--- END OF CONFIGURATION ---^^^---
+
+# --- Internal Field Separator ---
+# Sets how bash splits lines read from the CSV
 IFS=','
 
-tail -n +2 "$CSV" | while read -r SamAccountName GivenName Surname Mail Department Folder MemberOf
-do
-    SamAccountName=$(echo "$SamAccountName" | tr -d '"')
-    GivenName=$(echo "$GivenName" | tr -d '"')
-    Surname=$(echo "$Surname" | tr -d '"')
-    Mail=$(echo "$Mail" | tr -d '"')
-    Department=$(echo "$Department" | tr -d '"')
-    Folder=$(echo "$Folder" | tr -d '"')
-    MemberOf=$(echo "$MemberOf" | tr -d '"' | tr ';' ',')
+# --- Function: Create OU if Missing ---
+# Ensures the specified OU exists, creating it and its parent (if needed) along the way.
+# Usage: create_ou_if_missing "SpecificOUName" "ParentOUPath"
+create_ou_if_missing() {
+    local specific_ou_component="$1" # e.g., "Group2025"
+    local parent_ou_path="$2"       # e.g., "OU=LAB USERS,OU=LABOR"
+    local full_ou_path="OU=${specific_ou_component},${parent_ou_path}" # e.g., "OU=Group2025,OU=LAB USERS,OU=LABOR"
 
-    # Build DN path
-    OU="OU=${Folder},OU=*** USERS,OU=****,DC=****,DC=****"
-
-    # Check for admin users
-    if [[ "$MemberOf" == *"Domain Admins"* ]] || [[ "$MemberOf" == *"Admins"* ]]; then
-        PASSWORD='****'
-    else
-        PASSWORD='***'
+    # Check if the specific OU already exists using samba-tool ou list
+    # The grep uses -F for fixed string matching and -q for quiet mode (only exit status matters)
+    if samba-tool ou list | grep -Fq "$full_ou_path"; then
+        # echo "DEBUG: OU '$full_ou_path' already exists." # Uncomment for verbose debugging
+        return 0 # OU exists, success
     fi
 
-    echo "Creating user: $SamAccountName (Folder: $Folder)"
-
-    # Create the user
-    samba-tool user create "$SamAccountName" "$PASSWORD" \
-        --given-name="$GivenName" \
-        --surname="$Surname" \
-        --mail-address="$Mail" \
-        --department="$Department" \
-        --userou="$OU" \
-        --home-directory="/home/$SamAccountName"
-
-    # Force password change at next login
-    samba-tool user setexpiry "$SamAccountName" --days=0
-
-    # Add user to groups
-    IFS=',' read -ra GROUPS <<< "$MemberOf"
-    for group in "${GROUPS[@]}"; do
-        group=$(echo "$group" | xargs)
-        if [ -n "$group" ]; then
-            echo "  Adding $SamAccountName to group: $group"
-            samba-tool group addmembers "$group" "$SamAccountName"
+    # Specific OU doesn't exist. First, ensure the Parent OU exists.
+    if ! samba-tool ou list | grep -Fq "$parent_ou_path"; then
+        echo "🔧 Parent OU '$parent_ou_path' missing. Attempting to create..."
+        # Note: This assumes the parent's parent (e.g., OU=LABOR) exists.
+        # For deeper nested structures, a recursive function might be needed.
+        if ! samba-tool ou create "$parent_ou_path"; then
+           echo "❌ ERROR: Failed to create PARENT OU: '$parent_ou_path'. Check permissions or ensure its parent OU exists."
+           return 1 # Indicate failure
         fi
-    done
+         echo "✅ Parent OU '$parent_ou_path' created successfully."
+    fi
 
-done
+    # Parent OU should exist now, try creating the Specific OU.
+    echo "🔧 Creating specific OU: '$full_ou_path'"
+    if ! samba-tool ou create "$full_ou_path"; then
+       echo "❌ ERROR: Failed to create specific OU: '$full_ou_path'. Check permissions."
+       return 1 # Indicate failure
+    fi
+    echo "✅ Specific OU '$full_ou_path' created successfully."
+    return 0 # Indicate success
+}
+
+# --- Pre-flight Checks ---
+echo "🚀 Starting Samba User Creation Script..."
+echo "ℹ️ Using CSV file: $CSV_FILE"
+echo "ℹ️ Base OU for users: $BASE_OU"
+echo "ℹ️ Target Domain DN: $DOMAIN_DN"
+
+if [[ ! -f "$CSV_FILE" ]]; then
+    echo "❌ FATAL ERROR: CSV file not found at '$CSV_FILE'."
+    exit 1
+fi
+
+# Optional: Add a check for samba-tool command existence
+# if ! command -v samba-tool &> /dev/null; then
+#     echo "❌ FATAL ERROR: 'samba-tool' command not found. Is Samba installed and in PATH?"
+#     exit 1
+# fi
+
+# Optional: Verify connectivity or basic domain info
+# if ! samba-tool domain info &> /dev/null; then
+#     echo "❌ FATAL ERROR: Cannot connect to domain '$DOMAIN_DN' using samba-tool. Check configuration and permissions."
+#     exit 1
+# fi
+echo "--------------------------------------------------"
+
+# --- Main Processing Loop ---
+# Reads the CSV file line by line, skipping the header row (tail -n +2)
+# Uses process substitution <(...) to avoid issues with variables modified inside the loop scope.
+# Handles lines that might not end with a newline character (|| [[ -n "${fields[0]}" ]]).
+line_number=1
+processed_count=0
+skipped_count=0
+error_count=0
+
+while IFS=',' read -r -a fields || [[ -n "${fields[0]}" ]]; do
+    ((line_number++))
+    # Trim leading/trailing whitespace and remove quotes for common fields
+    # Use parameter expansion ${fields[index]:-} to avoid errors if a field is missing entirely
+    SamAccountName=$(echo "${fields[0]:-}" | tr -d '"[:space:]' | sed 's/[^a-zA-Z0-9._-]//g' | sed 's/^_//') # Clean username
+    GivenName=$(echo "${fields[1]:-}" | tr -d '"' | xargs)
+    Surname=$(echo "${fields[2]:-}" | tr -d '"' | xargs)
+    Mail=$(echo "${fields[3]:-}" | tr -d '"' | xargs)
+    Department=$(echo "${fields[4]:-}" | tr -d '"' | xargs)
+    Folder=$(echo "${fields[5]:-}" | tr -d '"' | xargs | tr -cd '[:print:]') # Keep filtering non-printable
+    MemberOf=$(echo "${fields[6]:-}" | tr -d '"' | xargs | tr ';' ',') # Standardize group separator to comma
+
+    # --- Input Validation ---
+    if [[ -z "$SamAccountName" || -z "$Folder" ]]; then
+        echo "⚠️ [Line $line_number] Skipping entry: Missing SamAccountName or Folder. Data: ${fields[*]}"
+        ((skipped_count++))
+        continue
+    fi
+
+    echo "--- [Line $line_number] Processing User: $SamAccountName ---"
+
+    # --- Data Defaults and Cleanup ---
+    if [[ -z "$Mail" ]]; then
+        Mail="$DEFAULT_MAIL"
+        echo "  ℹ️ Using default email: $Mail"
+    fi
+
+    # Improved Surname logic: Use field if present, else try extracting from GivenName, else 'Unknown'
+    if [[ -z "$Surname" ]]; then
+        if [[ "$GivenName" == *.* ]]; then
+             # Takes the part after the *last* dot as surname
+             Surname=$(echo "$GivenName" | sed 's/.*\.\([^.]*\)/\1/')
+             # Update GivenName to remove the extracted surname part (optional, but cleaner)
+             GivenName=$(echo "$GivenName" | sed 's/\.[^.]*$//')
+             echo "  ℹ️ Extracted Surname '$Surname' from GivenName '$GivenName'."
+        else
+            Surname="Unknown" # Fallback if no dot or surname field empty
+            echo "  ℹ️ Using default Surname 'Unknown'."
+        fi
+    fi
+    # Ensure Surname isn't empty if GivenName was simple and Surname field was empty
+    [[ -z "$Surname" ]] && Surname="Unknown"
+
+    echo "  GivenName: $GivenName"
+    echo "  Surname: $Surname"
+    echo "  Folder (OU Component): $Folder"
+    echo "  Target OU Path: OU=$Folder,$BASE_OU"
+
+    # --- OU Handling ---
+    # Call function to ensure the target OU exists
+    if ! create_ou_if_missing "$Folder" "$BASE_OU"; then
+        echo "⚠️ Skipping user '$SamAccountName' due to OU setup failure for 'OU=$Folder,$BASE_OU'."
+        ((skipped_count++))
+        ((error_count++)) # Count OU failure as an error
+        continue
+    fi
+
+    # --- Determine Password ---
+    PASSWORD="$DEFAULT_PASSWORD"
+    # Check for admin indicators (case-insensitive check might be better depending on data)
+    # Using commas around MemberOf ensures whole group name matching
+    if [[ ",${MemberOf}," == *",Domain Admins,"* ]] || [[ ",${MemberOf}," == *",Administrators,"* ]]; then
+        PASSWORD="$ADMIN_PASSWORD"
+        echo "  ℹ️ User designated as admin, using admin password."
+    fi
+
+    # --- User Deletion (Conditional) ---
+    user_exists=false
+    if samba-tool user show "$SamAccountName" &>/dev/null; then
+        user_exists=true
+    fi
+
+    if [[ "$user_exists" == "true" && "$ENABLE_USER_DELETION" == "true" ]]; then
+        echo "⚠️ User '$SamAccountName' already exists. Deleting first as ENABLE_USER_DELETION is true..."
+        if ! samba-tool user delete "$SamAccountName"; then
+            echo "❌ ERROR: Failed to delete existing user '$SamAccountName'. Skipping creation."
+            ((skipped_count++))
+            ((error_count++))
+            continue
+        fi
+        echo "  ✅ Existing user '$SamAccountName' deleted."
+    elif [[ "$user_exists" == "true" && "$ENABLE_USER_DELETION" == "false" ]]; then
+         echo "⚠️ User '$SamAccountName' already exists. Skipping creation as ENABLE_USER_DELETION is false."
+         ((skipped_count++))
+         continue
+    fi
+
+    # --- User Creation ---
+    echo "👤 Creating user: '$SamAccountName' in 'OU=$Folder,$BASE_OU'"
+    # Construct arguments array for samba-tool for clarity and safety
+    home_dir="${HOME_DIRECTORY_TEMPLATE//%USERNAME%/$SamAccountName}" # Replace placeholder
+    cmd_args=(
+        user create "$SamAccountName" "$PASSWORD"
+        --given-name="$GivenName"
+        --surname="$Surname"
+        --mail-address="$Mail"
+        --home-directory="$home_dir"
+        --use-username-as-cn
+        # --userou specifies the OU relative to the domain DN
+        --userou="OU=$Folder,$BASE_OU"
+    )
+    # Conditionally add department if it's not empty
+    [[ -n "$Department" ]] && cmd_args+=(--department="$Department")
+
+    echo "  ▶️ Executing: samba-tool ${cmd_args[*]}"
+    # Execute the command and check exit status
+    if ! samba-tool "${cmd_args[@]}"; then
+        echo "❌ ERROR: Failed to create user '$SamAccountName'. Check samba-tool output/logs above for details."
+        ((error_count++))
+        continue # Skip group membership if creation failed
+    fi
+    echo "✅ User '$SamAccountName' created successfully."
+
+    # --- Post-Creation Steps: Password Expiry ---
+    echo "  ⏳ Setting password for '$SamAccountName' to never expire (account enabled)."
+    # Setting expiry to 0 days usually means password doesn't expire, but also enables the account if disabled.
+    if ! samba-tool user setexpiry "$SamAccountName" --days=0; then
+       echo "  ⚠️ Warning: Failed to set password expiry/enable account for '$SamAccountName'."
+       # This might not be critical, but worth noting.
+    fi
+
+    # --- Post-Creation Steps: Group Membership ---
+    if [[ -n "$MemberOf" ]]; then
+        echo "👥 Adding '$SamAccountName' to groups: $MemberOf"
+        # Read groups into an array, splitting by comma
+        IFS=',' read -ra GROUPS <<< "$MemberOf"
+        group_errors=0
+        for group in "${GROUPS[@]}"; do
+            # Trim whitespace from group name
+            group=$(echo "$group" | xargs)
+            if [[ -z "$group" || "$group" == "0" ]]; then # Skip empty or "0" group names
+                continue
+            fi
+            echo "    ➕ Adding '$SamAccountName' to group: '$group'"
+            # Add user to group, check for errors
+            if ! samba-tool group addmembers "$group" "$SamAccountName"; then
+                echo "    ❌ ERROR: Failed to add '$SamAccountName' to group '$group'. Does the group exist? Check permissions."
+                ((group_errors++))
+            fi
+        done
+        # Report group errors for this user
+        if [[ $group_errors -gt 0 ]]; then
+            echo "  ⚠️ Encountered $group_errors error(s) while adding groups for '$SamAccountName'."
+            ((error_count++)) # Count this as a partial error for the user
+        fi
+        # Restore IFS if changed within loop (though subshell/function scope usually handles this)
+        # IFS=','
+    else
+        echo "  ℹ️ No groups specified in CSV for '$SamAccountName'."
+    fi
+
+    ((processed_count++))
+    echo "--- User '$SamAccountName' processing complete ---"
+    echo # Add a blank line for readability between users
+
+done < <(tail -n +2 "$CSV_FILE") # Read from CSV specified in config, skipping header
+
+# --- Summary ---
+echo "=================================================="
+echo "✅ Script finished."
+echo "Processed $processed_count users successfully."
+echo "Skipped $skipped_count entries (due to missing data, existing user with deletion disabled, or OU errors)."
+echo "Encountered $error_count errors during processing (user creation, deletion, or group membership)."
+echo "=================================================="
+
+exit 0
