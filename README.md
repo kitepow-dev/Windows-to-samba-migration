@@ -94,5 +94,5 @@ The consistency of the CSV file format between the export and import scripts is 
 
 ---
 
-*[Optional: Add License Information Here]*
+*[Creative Commons Zero v1.0 Universal]*
 
